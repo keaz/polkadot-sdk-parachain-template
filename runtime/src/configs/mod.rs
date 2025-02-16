@@ -317,5 +317,7 @@ parameter_types! {
 // Configure custom pallet.
 impl custom_pallet::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
-    type CounterMaxValue = CounterMaxValue;
+    type MaxNameLength = ConstU32<128>;
+    type MaxEmailLength = ConstU32<255>;
+    type MaxDocHashLength = ConstU32<64>;
 }

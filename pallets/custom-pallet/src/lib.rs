@@ -6,21 +6,53 @@ pub use pallet::*;
 pub mod pallet {
     use super::*;
     use frame_support::pallet_prelude::*;
+    use frame_support::BoundedVec;
     use frame_system::pallet_prelude::*;
+    use scale_info::TypeInfo;
+    use sp_std::vec::Vec;
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
 
+    // Configuration trait for the pallet.
     // Configuration trait for the pallet.
     #[pallet::config]
     pub trait Config: frame_system::Config {
         // Defines the event type for the pallet.
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
-        // Defines the maximum value the counter can hold.
+        // Add these type constants
         #[pallet::constant]
-        type CounterMaxValue: Get<u32>;
+        type MaxNameLength: Get<u32> + scale_info::TypeInfo;
+
+        #[pallet::constant]
+        type MaxEmailLength: Get<u32> + scale_info::TypeInfo;
+
+        #[pallet::constant]
+        type MaxDocHashLength: Get<u32> + scale_info::TypeInfo;
     }
+
+    #[pallet::storage]
+    #[pallet::getter(fn identities)]
+    pub type Identities<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        IdentityInfo<T::MaxNameLength, T::MaxEmailLength, T::MaxDocHashLength>,
+        OptionQuery,
+    >;
+
+    #[pallet::storage]
+    #[pallet::getter(fn verifications)]
+    pub type Verifications<T: Config> = StorageDoubleMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId, // Validator
+        Blake2_128Concat,
+        T::AccountId, // Identity owner
+        bool,
+        OptionQuery,
+    >;
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -48,6 +80,9 @@ pub mod pallet {
             /// The amount by which the counter was decremented.
             decremented_amount: u32,
         },
+        IdentityCreated(T::AccountId),
+        IdentityVerified(T::AccountId, T::AccountId),
+        IdentityRevoked(T::AccountId),
     }
 
     /// Storage for the current value of the counter.
@@ -68,118 +103,86 @@ pub mod pallet {
         CounterOverflow,
         /// Overflow occurred in user interactions.
         UserInteractionOverflow,
+        IdentityNotFound,
+        AlreadyVerified,
+        NotAuthorized,
+        NameTooLong,
+        EmailTooLong,
+        DocHashTooLong,
     }
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Set the value of the counter.
-        ///
-        /// The dispatch origin of this call must be _Root_.
-        ///
-        /// - `new_value`: The new value to set for the counter.
-        ///
-        /// Emits `CounterValueSet` event when successful.
-        #[pallet::call_index(0)]
-        #[pallet::weight(0)]
-        pub fn set_counter_value(origin: OriginFor<T>, new_value: u32) -> DispatchResult {
-            ensure_root(origin)?;
+        #[pallet::weight(10_000)]
+        pub fn create_or_update_identity(
+            origin: OriginFor<T>,
+            name: Vec<u8>,
+            email: Vec<u8>,
+            document_hash: Vec<u8>,
+        ) -> DispatchResult {
+            let user = ensure_signed(origin)?;
 
-            ensure!(
-                new_value <= T::CounterMaxValue::get(),
-                Error::<T>::CounterValueExceedsMax
-            );
+            // Convert to bounded vectors
+            let bounded_name = BoundedVec::<u8, T::MaxNameLength>::try_from(name)
+                .map_err(|_| Error::<T>::NameTooLong)?;
+            let bounded_email = BoundedVec::<u8, T::MaxEmailLength>::try_from(email)
+                .map_err(|_| Error::<T>::EmailTooLong)?;
+            let bounded_doc_hash = BoundedVec::<u8, T::MaxDocHashLength>::try_from(document_hash)
+                .map_err(|_| Error::<T>::DocHashTooLong)?;
 
-            CounterValue::<T>::put(new_value);
+            let identity = IdentityInfo {
+                name: bounded_name,
+                email: bounded_email,
+                document_hash: bounded_doc_hash,
+                revoked: false,
+            };
 
-            Self::deposit_event(Event::<T>::CounterValueSet {
-                counter_value: new_value,
-            });
-
+            Identities::<T>::insert(&user, identity);
+            Self::deposit_event(Event::IdentityCreated(user));
             Ok(())
         }
 
-        /// Increment the counter by a specified amount.
-        ///
-        /// This function can be called by any signed account.
-        ///
-        /// - `amount_to_increment`: The amount by which to increment the counter.
-        ///
-        /// Emits `CounterIncremented` event when successful.
-        #[pallet::call_index(1)]
-        #[pallet::weight(0)]
-        pub fn increment(origin: OriginFor<T>, amount_to_increment: u32) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-
-            let current_value = CounterValue::<T>::get().unwrap_or(0);
-
-            let new_value = current_value
-                .checked_add(amount_to_increment)
-                .ok_or(Error::<T>::CounterOverflow)?;
+        #[pallet::weight(10_000)]
+        pub fn verify_identity(origin: OriginFor<T>, target: T::AccountId) -> DispatchResult {
+            let validator = ensure_signed(origin)?;
 
             ensure!(
-                new_value <= T::CounterMaxValue::get(),
-                Error::<T>::CounterValueExceedsMax
+                Identities::<T>::contains_key(&target),
+                Error::<T>::IdentityNotFound
+            );
+            ensure!(
+                !Verifications::<T>::contains_key(&validator, &target),
+                Error::<T>::AlreadyVerified
             );
 
-            CounterValue::<T>::put(new_value);
-
-            UserInteractions::<T>::try_mutate(&who, |interactions| -> Result<_, Error<T>> {
-                let new_interactions = interactions
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or(Error::<T>::UserInteractionOverflow)?;
-                *interactions = Some(new_interactions); // Store the new value.
-
-                Ok(())
-            })?;
-
-            Self::deposit_event(Event::<T>::CounterIncremented {
-                counter_value: new_value,
-                who,
-                incremented_amount: amount_to_increment,
-            });
-
+            Verifications::<T>::insert(&validator, &target, true);
+            Self::deposit_event(Event::IdentityVerified(validator, target));
             Ok(())
         }
 
-        /// Decrement the counter by a specified amount.
-        ///
-        /// This function can be called by any signed account.
-        ///
-        /// - `amount_to_decrement`: The amount by which to decrement the counter.
-        ///
-        /// Emits `CounterDecremented` event when successful.
-        #[pallet::call_index(2)]
-        #[pallet::weight(0)]
-        pub fn decrement(origin: OriginFor<T>, amount_to_decrement: u32) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-
-            let current_value = CounterValue::<T>::get().unwrap_or(0);
-
-            let new_value = current_value
-                .checked_sub(amount_to_decrement)
-                .ok_or(Error::<T>::CounterValueBelowZero)?;
-
-            CounterValue::<T>::put(new_value);
-
-            UserInteractions::<T>::try_mutate(&who, |interactions| -> Result<_, Error<T>> {
-                let new_interactions = interactions
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or(Error::<T>::UserInteractionOverflow)?;
-                *interactions = Some(new_interactions); // Store the new value.
-
-                Ok(())
-            })?;
-
-            Self::deposit_event(Event::<T>::CounterDecremented {
-                counter_value: new_value,
-                who,
-                decremented_amount: amount_to_decrement,
+        #[pallet::weight(10_000)]
+        pub fn revoke_identity(origin: OriginFor<T>) -> DispatchResult {
+            let user = ensure_signed(origin)?;
+            Identities::<T>::mutate(&user, |identity| {
+                if let Some(id) = identity {
+                    id.revoked = true;
+                }
             });
-
+            Self::deposit_event(Event::IdentityRevoked(user));
             Ok(())
         }
     }
-}
 
+    #[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen, Default)]
+    pub struct IdentityInfo<NameLimit, EmailLimit, DocHashLimit>
+    where
+        NameLimit: Get<u32> + TypeInfo,
+        EmailLimit: Get<u32> + TypeInfo,
+        DocHashLimit: Get<u32> + TypeInfo,
+    {
+        pub name: BoundedVec<u8, NameLimit>,
+        pub email: BoundedVec<u8, EmailLimit>,
+        pub document_hash: BoundedVec<u8, DocHashLimit>,
+        pub revoked: bool,
+    }
+}
